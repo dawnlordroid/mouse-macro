@@ -37,6 +37,13 @@ public class MacroConfig
     public int CheckTimeoutMs { get; set; } = 5000;
     public int StartDelaySec { get; set; } = 3;
     public int JitterMs { get; set; } = 0; // random +/- jitter applied to each delay
+    public bool UsePerStepDelay { get; set; } = true; // false = GlobalIntervalMs overrides Click step delays
+    public int GlobalIntervalMs { get; set; } = 1000;
+    public double SpeedMultiplier { get; set; } = 1.0; // 2.0 = half the wait
+    public int MoveWaitMs { get; set; } = 50; // cursor move -> mouse down
+    public int PressMs { get; set; } = 30; // mouse down -> mouse up
+    public int CheckIntervalMs { get; set; } = 250; // retry interval of the check step
+    public bool MiddleButtonStop { get; set; } = true;
     public string Monitor { get; set; } = ""; // Screen.DeviceName; empty = primary
     public bool RelativeToMonitor { get; set; } = true;
     public bool ScaleToResolution { get; set; } = true;

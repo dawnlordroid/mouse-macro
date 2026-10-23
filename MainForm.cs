@@ -1,4 +1,6 @@
 using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
 
 namespace MouseMacro;
 
@@ -29,6 +31,13 @@ public class MainForm : Form
     Bitmap? refImage;
     readonly NumericUpDown startDelay = new() { Minimum = 0, Maximum = 600, Value = 3, Width = 60 };
     readonly NumericUpDown jitter = new() { Minimum = 0, Maximum = 60000, Increment = 50, Value = 0, Width = 70 };
+    readonly CheckBox perStepChk = new() { Text = "단계별 개별 딜레이 사용", Checked = true, AutoSize = true };
+    readonly NumericUpDown globalInterval = new() { Minimum = 0, Maximum = 600000, Increment = 100, Value = 1000, Width = 80, Enabled = false };
+    readonly NumericUpDown speedMul = new() { Minimum = 0.25m, Maximum = 5m, DecimalPlaces = 2, Increment = 0.25m, Value = 1m, Width = 60 };
+    readonly NumericUpDown moveWait = new() { Minimum = 0, Maximum = 10000, Increment = 10, Value = 50, Width = 70 };
+    readonly NumericUpDown pressMs = new() { Minimum = 0, Maximum = 10000, Increment = 10, Value = 30, Width = 70 };
+    readonly NumericUpDown checkInterval = new() { Minimum = 10, Maximum = 60000, Increment = 50, Value = 250, Width = 70 };
+    readonly CheckBox middleStopChk = new() { Text = "마우스 휠 클릭(가운데 버튼)으로도 중지", Checked = true, AutoSize = true };
     readonly Label mouseLabel = new() { AutoSize = true, Margin = new Padding(3, 6, 3, 0) };
     readonly Button startBtn = new() { Text = "시작 (F10)", AutoSize = true };
     readonly Button stopBtn = new() { Text = "중지 (F12)", AutoSize = true, Enabled = false };
@@ -38,13 +47,30 @@ public class MainForm : Form
     Screen[] screens = Screen.AllScreens;
     CancellationTokenSource? cts;
     readonly Random rng = new();
+    readonly object stopLock = new();
+
+    // Hook delegates are kept in fields so they are not garbage collected.
+    Native.LowLevelProc? kbProc, mouseProc;
+    IntPtr kbHook, mouseHook;
+    bool f12HookDown;
+    int f12PollPrev;
+    volatile bool middleStopEnabled = true;
+    Thread? pollThread;
+    volatile bool closing;
+    static readonly bool IsAdmin = CheckAdmin();
+
+    static bool CheckAdmin()
+    {
+        try { return new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator); }
+        catch { return false; }
+    }
 
     bool Running => cts != null;
 
     public MainForm()
     {
-        Text = "좌표 클릭 마우스 매크로";
-        Width = 960; Height = 720;
+        Text = $"좌표 클릭 마우스 매크로 - 관리자 권한: {(IsAdmin ? "예" : "아니오")}";
+        Width = 960; Height = 820;
         StartPosition = FormStartPosition.CenterScreen;
 
         grid.Columns.Add(new DataGridViewComboBoxColumn
@@ -85,8 +111,15 @@ public class MainForm : Form
         var top = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false };
         top.Controls.Add(Flow(Lbl("모니터"), monitorBox, relativeChk));
         top.Controls.Add(Flow(Lbl("기준 해상도"), refW, Lbl("x"), refH, scaleChk));
-        top.Controls.Add(Flow(Lbl("반복(0=무한)"), repeat, Lbl("시작 전 대기(초)"), startDelay, Lbl("대기 랜덤 ±(ms)"), jitter));
-        top.Controls.Add(Flow(Lbl("최대 반복(0=무제한)"), maxRepeats, Lbl("유사도 임계값"), threshold, Lbl("확인 타임아웃(ms)"), checkTimeout));
+        top.Controls.Add(Flow(Lbl("반복(0=무한)"), repeat, Lbl("시작 전 대기(초)"), startDelay, Lbl("최대 반복(0=무제한)"), maxRepeats));
+        top.Controls.Add(Flow(Lbl("유사도 임계값"), threshold, middleStopChk));
+        var speedBox = new GroupBox { Text = "속도", Dock = DockStyle.Top, AutoSize = true };
+        var speedFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false };
+        speedFlow.Controls.Add(Flow(perStepChk, Lbl("클릭 간격(ms)"), globalInterval, Lbl("속도 배율(x)"), speedMul, Lbl("랜덤 ±(ms)"), jitter));
+        speedFlow.Controls.Add(Flow(Lbl("이동 후 대기(ms)"), moveWait, Lbl("누름 시간(ms)"), pressMs));
+        speedFlow.Controls.Add(Flow(Lbl("확인 재시도 간격(ms)"), checkInterval, Lbl("확인 타임아웃(ms)"), checkTimeout));
+        speedBox.Controls.Add(speedFlow);
+        top.Controls.Add(speedBox);
         top.Controls.Add(Flow(refBtn, Lbl("기준:"), refPic, Lbl("최근 캡처:"), lastPic));
         top.Controls.Add(Flow(startBtn, stopBtn, saveBtn, loadBtn));
         top.Controls.Add(Flow(addBtn, delBtn, upBtn, downBtn, captureBtn, moveBtn));
@@ -104,9 +137,11 @@ public class MainForm : Form
         moveBtn.Click += (_, _) => MoveOnly();
         refBtn.Click += (_, _) => CaptureReference();
         startBtn.Click += (_, _) => Start();
-        stopBtn.Click += (_, _) => Stop();
+        stopBtn.Click += (_, _) => StopFrom("중지 버튼");
         saveBtn.Click += (_, _) => SaveDialog();
         loadBtn.Click += (_, _) => LoadDialog();
+        perStepChk.CheckedChanged += (_, _) => globalInterval.Enabled = !perStepChk.Checked;
+        middleStopChk.CheckedChanged += (_, _) => middleStopEnabled = middleStopChk.Checked;
         monitorBox.SelectedIndexChanged += (_, _) => UpdateMouseLabel();
         relativeChk.CheckedChanged += (_, _) => UpdateMouseLabel();
         scaleChk.CheckedChanged += (_, _) => UpdateMouseLabel();
@@ -140,6 +175,8 @@ public class MainForm : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
+        InstallHooks();
+        StartPollThread();
         if (!Native.RegisterHotKey(Handle, Native.HOTKEY_STOP, 0, Native.VK_F12)) Log("F12 단축키 등록 실패");
         if (!Native.RegisterHotKey(Handle, Native.HOTKEY_CAPTURE, 0, Native.VK_F8)) Log("F8 단축키 등록 실패");
         if (!Native.RegisterHotKey(Handle, Native.HOTKEY_TOGGLE, 0, Native.VK_F10)) Log("F10 단축키 등록 실패");
@@ -147,7 +184,11 @@ public class MainForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        closing = true;
         cts?.Cancel();
+        if (kbHook != IntPtr.Zero) Native.UnhookWindowsHookEx(kbHook);
+        if (mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(mouseHook);
+        kbHook = mouseHook = IntPtr.Zero;
         try { CurrentConfig().Save(MacroConfig.DefaultPath); } catch { }
         Native.UnregisterHotKey(Handle, Native.HOTKEY_STOP);
         Native.UnregisterHotKey(Handle, Native.HOTKEY_CAPTURE);
@@ -161,12 +202,70 @@ public class MainForm : Form
         {
             switch (m.WParam.ToInt32())
             {
-                case Native.HOTKEY_STOP: Stop(); break;
+                case Native.HOTKEY_STOP: StopFrom("F12"); break;
                 case Native.HOTKEY_CAPTURE: CaptureToSelected(); break;
-                case Native.HOTKEY_TOGGLE: if (Running) Stop(); else Start(); break;
+                case Native.HOTKEY_TOGGLE: if (Running) StopFrom("F10"); else Start(); break;
             }
         }
         base.WndProc(ref m);
+    }
+
+    void InstallHooks()
+    {
+        var mod = Native.GetModuleHandle(null);
+        kbProc = KeyboardHook;
+        mouseProc = MouseHook;
+        kbHook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, kbProc, mod, 0);
+        mouseHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, mouseProc, mod, 0);
+        if (kbHook == IntPtr.Zero) Log("키보드 훅 설치 실패 (폴링으로 F12 중지)");
+        if (mouseHook == IntPtr.Zero) Log("마우스 훅 설치 실패");
+    }
+
+    IntPtr KeyboardHook(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0)
+        {
+            uint vk = (uint)Marshal.ReadInt32(lParam);
+            int msg = wParam.ToInt32();
+            bool down = msg == Native.WM_KEYDOWN || msg == Native.WM_SYSKEYDOWN;
+            bool up = msg == Native.WM_KEYUP || msg == Native.WM_SYSKEYUP;
+            if (vk == Native.VK_F12)
+            {
+                if (down && !f12HookDown) { f12HookDown = true; StopFrom("F12"); }
+                else if (up) f12HookDown = false;
+            }
+            else if (down && vk == Native.VK_F8) BeginInvoke(CaptureToSelected);
+            else if (down && vk == Native.VK_F10) BeginInvoke(() => { if (Running) StopFrom("F10"); else Start(); });
+        }
+        return Native.CallNextHookEx(kbHook, nCode, wParam, lParam);
+    }
+
+    IntPtr MouseHook(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && wParam.ToInt32() == Native.WM_MBUTTONDOWN && middleStopEnabled)
+            StopFrom("가운데 버튼");
+        return Native.CallNextHookEx(mouseHook, nCode, wParam, lParam);
+    }
+
+    // Edge-detected F12 polling, shared by the poll thread and every wait of the run loop.
+    bool F12Pressed()
+    {
+        int now = Native.IsKeyDown(Native.VK_F12) ? 1 : 0;
+        return Interlocked.Exchange(ref f12PollPrev, now) == 0 && now == 1;
+    }
+
+    void StartPollThread()
+    {
+        if (pollThread != null) return;
+        pollThread = new Thread(() =>
+        {
+            while (!closing)
+            {
+                if (F12Pressed()) StopFrom("F12");
+                Thread.Sleep(15);
+            }
+        }) { IsBackground = true, Name = "F12Poll" };
+        pollThread.Start();
     }
 
     void FillMonitors(string selectedDevice)
@@ -196,6 +295,13 @@ public class MainForm : Form
         CheckTimeoutMs = (int)checkTimeout.Value,
         StartDelaySec = (int)startDelay.Value,
         JitterMs = (int)jitter.Value,
+        UsePerStepDelay = perStepChk.Checked,
+        GlobalIntervalMs = (int)globalInterval.Value,
+        SpeedMultiplier = (double)speedMul.Value,
+        MoveWaitMs = (int)moveWait.Value,
+        PressMs = (int)pressMs.Value,
+        CheckIntervalMs = (int)checkInterval.Value,
+        MiddleButtonStop = middleStopChk.Checked,
         Monitor = monitorBox.SelectedIndex >= 0 ? screens[monitorBox.SelectedIndex].DeviceName : "",
         RelativeToMonitor = relativeChk.Checked,
         ScaleToResolution = scaleChk.Checked,
@@ -213,6 +319,13 @@ public class MainForm : Form
         checkTimeout.Value = Math.Clamp(c.CheckTimeoutMs, 0, (int)checkTimeout.Maximum);
         startDelay.Value = Math.Clamp(c.StartDelaySec, 0, (int)startDelay.Maximum);
         jitter.Value = Math.Clamp(c.JitterMs, 0, (int)jitter.Maximum);
+        perStepChk.Checked = c.UsePerStepDelay;
+        globalInterval.Value = Math.Clamp(c.GlobalIntervalMs, 0, (int)globalInterval.Maximum);
+        speedMul.Value = (decimal)Math.Clamp(c.SpeedMultiplier, (double)speedMul.Minimum, (double)speedMul.Maximum);
+        moveWait.Value = Math.Clamp(c.MoveWaitMs, 0, (int)moveWait.Maximum);
+        pressMs.Value = Math.Clamp(c.PressMs, 0, (int)pressMs.Maximum);
+        checkInterval.Value = Math.Clamp(c.CheckIntervalMs, (int)checkInterval.Minimum, (int)checkInterval.Maximum);
+        middleStopChk.Checked = c.MiddleButtonStop;
         relativeChk.Checked = c.RelativeToMonitor;
         scaleChk.Checked = c.ScaleToResolution;
         refW.Value = Math.Clamp(c.RefWidth, 1, (int)refW.Maximum);
@@ -381,11 +494,22 @@ public class MainForm : Form
         }));
     }
 
-    void Stop()
+    // Thread-safe and idempotent per run: safe to call from hooks, the poll thread and the UI.
+    void StopFrom(string source)
     {
-        if (cts == null) return;
-        cts.Cancel();
-        Log("중지 요청");
+        lock (stopLock)
+        {
+            var c = cts;
+            if (c == null) return;
+            try
+            {
+                if (c.IsCancellationRequested) return;
+                c.Cancel();
+            }
+            catch (ObjectDisposedException) { return; }
+        }
+        Log($"{source}로 중지");
+        System.Media.SystemSounds.Beep.Play();
     }
 
     void RunMacro(MacroConfig cfg, Rectangle bounds, Bitmap? reference, CancellationToken ct)
@@ -411,17 +535,21 @@ public class MainForm : Form
                         continue;
                     }
                     var abs = cfg.ToAbsolute(s.X, s.Y, bounds);
-                    Native.Click(abs.X, abs.Y, s.Button);
-                    Log($"[{r}회차] 단계 {i + 1}: {s.Button} 클릭 절대 ({abs.X}, {abs.Y}) {s.Note}");
-                    int d = s.DelayMs;
+                    Native.Click(abs.X, abs.Y, s.Button, cfg.MoveWaitMs, cfg.PressMs, ct);
+                    int baseDelay = cfg.UsePerStepDelay ? s.DelayMs : cfg.GlobalIntervalMs;
+                    double mul = cfg.SpeedMultiplier > 0 ? cfg.SpeedMultiplier : 1.0;
+                    int d = (int)Math.Round(baseDelay / mul);
                     if (cfg.JitterMs > 0) d += rng.Next(-cfg.JitterMs, cfg.JitterMs + 1);
-                    Wait(Math.Max(0, d), ct);
+                    d = Math.Max(0, d);
+                    Log($"[{r}회차] 단계 {i + 1}: {s.Button} 클릭 절대 ({abs.X}, {abs.Y}) {s.Note} / 실제 대기 {d}ms (기준 {baseDelay}ms, {mul:0.##}x)");
+                    Wait(d, ct);
                 }
             }
             Log("완료");
         }
         catch (OperationCanceledException) { Log("중지됨"); }
         catch (Exception ex) { Log("오류: " + ex.Message); }
+        finally { Native.ReleaseHeldButton(); }
     }
 
     bool RunCheck(MacroConfig cfg, Rectangle bounds, Bitmap reference, Step s, int round, int idx, CancellationToken ct)
@@ -439,7 +567,7 @@ public class MainForm : Form
             Log($"[{round}회차] 단계 {idx + 1}: 확인 유사도 {score:F3} (임계값 {cfg.Threshold:F2})");
             if (score >= cfg.Threshold) return true;
             if (DateTime.UtcNow >= deadline) break;
-            Wait(250, ct);
+            Wait(Math.Max(10, cfg.CheckIntervalMs), ct);
         }
         var msg = $"28일이 아님 → 중지 (유사도 {score:F3})";
         Log(msg);
@@ -448,8 +576,17 @@ public class MainForm : Form
         return false;
     }
 
-    static void Wait(int ms, CancellationToken ct)
+    // Waits in short slices so a cancel or an F12 press is noticed within ~15 ms.
+    void Wait(int ms, CancellationToken ct)
     {
-        if (ct.WaitHandle.WaitOne(ms)) throw new OperationCanceledException(ct);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
+        {
+            if (F12Pressed()) StopFrom("F12");
+            ct.ThrowIfCancellationRequested();
+            long left = ms - sw.ElapsedMilliseconds;
+            if (left <= 0) return;
+            if (ct.WaitHandle.WaitOne((int)Math.Min(left, 15))) throw new OperationCanceledException(ct);
+        }
     }
 }
