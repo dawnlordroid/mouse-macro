@@ -33,16 +33,54 @@ static class Native
         return new Point(p.X, p.Y);
     }
 
-    public static void Click(int x, int y, MouseButtonKind button)
+    public const int WH_KEYBOARD_LL = 13;
+    public const int WH_MOUSE_LL = 14;
+    public const int WM_KEYDOWN = 0x0100;
+    public const int WM_KEYUP = 0x0101;
+    public const int WM_SYSKEYDOWN = 0x0104;
+    public const int WM_SYSKEYUP = 0x0105;
+    public const int WM_MBUTTONDOWN = 0x0207;
+
+    public delegate IntPtr LowLevelProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelProc fn, IntPtr hMod, uint threadId);
+    [DllImport("user32.dll")] public static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [DllImport("user32.dll")] public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr GetModuleHandle(string? name);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
+
+    public static bool IsKeyDown(uint vk) => (GetAsyncKeyState((int)vk) & 0x8000) != 0;
+
+    static int held; // 0 = none, 1 = left down, 2 = right down
+
+    static INPUT MouseEvent(uint flag) => new() { type = 0, mi = new MOUSEINPUT { dwFlags = flag } };
+
+    // Always finishes with a mouse-up once the mouse-down was sent, even when cancelled.
+    public static void Click(int x, int y, MouseButtonKind button, int moveWaitMs, int pressMs, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         SetCursorPos(x, y);
-        Thread.Sleep(30);
-        uint downFlag = button == MouseButtonKind.Right ? 0x0008u : 0x0002u;
-        uint upFlag = button == MouseButtonKind.Right ? 0x0010u : 0x0004u;
-        var down = new INPUT { type = 0, mi = new MOUSEINPUT { dwFlags = downFlag } };
-        var up = new INPUT { type = 0, mi = new MOUSEINPUT { dwFlags = upFlag } };
+        if (moveWaitMs > 0 && ct.WaitHandle.WaitOne(moveWaitMs)) throw new OperationCanceledException(ct);
+        bool right = button == MouseButtonKind.Right;
+        var down = MouseEvent(right ? 0x0008u : 0x0002u);
+        var up = MouseEvent(right ? 0x0010u : 0x0004u);
+        held = right ? 2 : 1;
         SendInput(1, new[] { down }, Marshal.SizeOf<INPUT>());
-        Thread.Sleep(40);
-        SendInput(1, new[] { up }, Marshal.SizeOf<INPUT>());
+        try
+        {
+            if (pressMs > 0) ct.WaitHandle.WaitOne(pressMs);
+        }
+        finally
+        {
+            SendInput(1, new[] { up }, Marshal.SizeOf<INPUT>());
+            held = 0;
+        }
+    }
+
+    public static void ReleaseHeldButton()
+    {
+        int h = Interlocked.Exchange(ref held, 0);
+        if (h == 0) return;
+        SendInput(1, new[] { MouseEvent(h == 2 ? 0x0010u : 0x0004u) }, Marshal.SizeOf<INPUT>());
     }
 }
