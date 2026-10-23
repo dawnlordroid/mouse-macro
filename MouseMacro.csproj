@@ -16,8 +16,4 @@
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
 
-  <ItemGroup>
-    <EmbeddedResource Include="samples\doomyeon-sayong.png" LogicalName="doomyeon-sayong.png" />
-  </ItemGroup>
-
 </Project>
