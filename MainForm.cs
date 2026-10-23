@@ -20,7 +20,13 @@ public class MainForm : Form
     readonly CheckBox scaleChk = new() { Text = "해상도 비율 보정", Checked = true, AutoSize = true };
     readonly NumericUpDown refW = new() { Minimum = 1, Maximum = 20000, Value = 2560, Width = 70 };
     readonly NumericUpDown refH = new() { Minimum = 1, Maximum = 20000, Value = 1440, Width = 70 };
-    readonly NumericUpDown repeat = new() { Minimum = 0, Maximum = 1000000, Value = 1, Width = 80 };
+    readonly NumericUpDown repeat = new() { Minimum = 0, Maximum = 1000000, Value = 0, Width = 80 };
+    readonly NumericUpDown maxRepeats = new() { Minimum = 0, Maximum = 1000000, Value = 0, Width = 80 };
+    readonly NumericUpDown threshold = new() { Minimum = 0, Maximum = 1, DecimalPlaces = 2, Increment = 0.01m, Value = 0.90m, Width = 60 };
+    readonly NumericUpDown checkTimeout = new() { Minimum = 0, Maximum = 600000, Increment = 500, Value = 5000, Width = 80 };
+    readonly PictureBox refPic = new() { Width = 160, Height = 90, SizeMode = PictureBoxSizeMode.Zoom, BorderStyle = BorderStyle.FixedSingle };
+    readonly PictureBox lastPic = new() { Width = 160, Height = 90, SizeMode = PictureBoxSizeMode.Zoom, BorderStyle = BorderStyle.FixedSingle };
+    Bitmap? refImage;
     readonly NumericUpDown startDelay = new() { Minimum = 0, Maximum = 600, Value = 3, Width = 60 };
     readonly NumericUpDown jitter = new() { Minimum = 0, Maximum = 60000, Increment = 50, Value = 0, Width = 70 };
     readonly Label mouseLabel = new() { AutoSize = true, Margin = new Padding(3, 6, 3, 0) };
@@ -41,8 +47,18 @@ public class MainForm : Form
         Width = 960; Height = 720;
         StartPosition = FormStartPosition.CenterScreen;
 
-        grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = nameof(Step.X), HeaderText = "X", Width = 70 });
-        grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = nameof(Step.Y), HeaderText = "Y", Width = 70 });
+        grid.Columns.Add(new DataGridViewComboBoxColumn
+        {
+            DataPropertyName = nameof(Step.Type),
+            HeaderText = "종류",
+            DataSource = Enum.GetValues<StepType>(),
+            Width = 70,
+            FlatStyle = FlatStyle.Flat,
+        });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = nameof(Step.X), HeaderText = "X", Width = 60 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = nameof(Step.Y), HeaderText = "Y", Width = 60 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = nameof(Step.W), HeaderText = "W(확인)", Width = 60 });
+        grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = nameof(Step.H), HeaderText = "H(확인)", Width = 60 });
         grid.Columns.Add(new DataGridViewComboBoxColumn
         {
             DataPropertyName = nameof(Step.Button),
@@ -64,11 +80,14 @@ public class MainForm : Form
         var moveBtn = new Button { Text = "테스트 클릭 (이동만)", AutoSize = true };
         var saveBtn = new Button { Text = "저장", AutoSize = true };
         var loadBtn = new Button { Text = "불러오기", AutoSize = true };
+        var refBtn = new Button { Text = "기준 캡처", AutoSize = true };
 
         var top = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, FlowDirection = FlowDirection.TopDown, WrapContents = false };
         top.Controls.Add(Flow(Lbl("모니터"), monitorBox, relativeChk));
         top.Controls.Add(Flow(Lbl("기준 해상도"), refW, Lbl("x"), refH, scaleChk));
         top.Controls.Add(Flow(Lbl("반복(0=무한)"), repeat, Lbl("시작 전 대기(초)"), startDelay, Lbl("대기 랜덤 ±(ms)"), jitter));
+        top.Controls.Add(Flow(Lbl("최대 반복(0=무제한)"), maxRepeats, Lbl("유사도 임계값"), threshold, Lbl("확인 타임아웃(ms)"), checkTimeout));
+        top.Controls.Add(Flow(refBtn, Lbl("기준:"), refPic, Lbl("최근 캡처:"), lastPic));
         top.Controls.Add(Flow(startBtn, stopBtn, saveBtn, loadBtn));
         top.Controls.Add(Flow(addBtn, delBtn, upBtn, downBtn, captureBtn, moveBtn));
         top.Controls.Add(Flow(mouseLabel));
@@ -83,6 +102,7 @@ public class MainForm : Form
         downBtn.Click += (_, _) => MoveStep(1);
         captureBtn.Click += (_, _) => CaptureToSelected();
         moveBtn.Click += (_, _) => MoveOnly();
+        refBtn.Click += (_, _) => CaptureReference();
         startBtn.Click += (_, _) => Start();
         stopBtn.Click += (_, _) => Stop();
         saveBtn.Click += (_, _) => SaveDialog();
@@ -104,6 +124,7 @@ public class MainForm : Form
             ApplyConfig(new MacroConfig());
             Log("기본 설정 로드 실패: " + ex.Message);
         }
+        LoadReference();
         posTimer.Start();
     }
 
@@ -168,8 +189,11 @@ public class MainForm : Form
 
     MacroConfig CurrentConfig() => new()
     {
-        Steps = steps.Select(s => new Step { X = s.X, Y = s.Y, Button = s.Button, DelayMs = s.DelayMs, Note = s.Note }).ToList(),
+        Steps = steps.Select(s => new Step { Type = s.Type, X = s.X, Y = s.Y, W = s.W, H = s.H, Button = s.Button, DelayMs = s.DelayMs, Note = s.Note }).ToList(),
         Repeat = (int)repeat.Value,
+        MaxRepeats = (int)maxRepeats.Value,
+        Threshold = (double)threshold.Value,
+        CheckTimeoutMs = (int)checkTimeout.Value,
         StartDelaySec = (int)startDelay.Value,
         JitterMs = (int)jitter.Value,
         Monitor = monitorBox.SelectedIndex >= 0 ? screens[monitorBox.SelectedIndex].DeviceName : "",
@@ -184,6 +208,9 @@ public class MainForm : Form
         steps.Clear();
         foreach (var s in c.Steps) steps.Add(s);
         repeat.Value = Math.Clamp(c.Repeat, 0, (int)repeat.Maximum);
+        maxRepeats.Value = Math.Clamp(c.MaxRepeats, 0, (int)maxRepeats.Maximum);
+        threshold.Value = (decimal)Math.Clamp(c.Threshold, 0, 1);
+        checkTimeout.Value = Math.Clamp(c.CheckTimeoutMs, 0, (int)checkTimeout.Maximum);
         startDelay.Value = Math.Clamp(c.StartDelaySec, 0, (int)startDelay.Maximum);
         jitter.Value = Math.Clamp(c.JitterMs, 0, (int)jitter.Maximum);
         relativeChk.Checked = c.RelativeToMonitor;
@@ -247,6 +274,55 @@ public class MainForm : Form
         Log($"단계 {i + 1} 좌표 캡처: ({p.X}, {p.Y})");
     }
 
+    Rectangle AbsRegion(MacroConfig cfg, Step s, Rectangle bounds)
+    {
+        var p1 = cfg.ToAbsolute(s.X, s.Y, bounds);
+        var p2 = cfg.ToAbsolute(s.X + s.W, s.Y + s.H, bounds);
+        return new Rectangle(p1.X, p1.Y, Math.Max(1, p2.X - p1.X), Math.Max(1, p2.Y - p1.Y));
+    }
+
+    void SetPreview(PictureBox pb, Bitmap? bmp)
+    {
+        var old = pb.Image;
+        pb.Image = bmp;
+        old?.Dispose();
+    }
+
+    void LoadReference()
+    {
+        try
+        {
+            if (!File.Exists(MacroConfig.RefImagePath)) return;
+            using var fs = File.OpenRead(MacroConfig.RefImagePath);
+            using var tmp = new Bitmap(fs);
+            refImage = new Bitmap(tmp);
+            SetPreview(refPic, new Bitmap(refImage));
+            Log("기준 이미지 로드: " + MacroConfig.RefImagePath);
+        }
+        catch (Exception ex) { Log("기준 이미지 로드 실패: " + ex.Message); }
+    }
+
+    void CaptureReference()
+    {
+        if (Running) { Log("매크로를 먼저 중지하세요."); return; }
+        grid.EndEdit();
+        var step = steps.ElementAtOrDefault(SelectedIndex()) is { Type: StepType.Check } sel
+            ? sel : steps.FirstOrDefault(s => s.Type == StepType.Check);
+        if (step == null) { Log("확인 단계가 없습니다."); return; }
+        try
+        {
+            var r = AbsRegion(CurrentConfig(), step, MonitorBounds());
+            using var bmp = ImageCheck.Capture(r);
+            Directory.CreateDirectory(MacroConfig.DefaultDir);
+            bmp.Save(MacroConfig.RefImagePath, System.Drawing.Imaging.ImageFormat.Png);
+            refImage?.Dispose();
+            refImage = new Bitmap(bmp);
+            SetPreview(refPic, new Bitmap(bmp));
+            Log($"기준 캡처 저장: 절대 ({r.X}, {r.Y}, {r.Width}x{r.Height}) → {MacroConfig.RefImagePath}");
+        }
+        catch (Exception ex) { Log("기준 캡처 실패: " + ex.Message); }
+    }
+
     void MoveOnly()
     {
         grid.EndEdit();
@@ -281,11 +357,23 @@ public class MainForm : Form
         if (steps.Count == 0) { Log("단계가 없습니다."); return; }
         var cfg = CurrentConfig();
         var bounds = MonitorBounds();
+        Bitmap? reference = null;
+        if (cfg.Steps.Any(s => s.Type == StepType.Check))
+        {
+            if (refImage == null)
+            {
+                Log("먼저 기준 캡처를 하세요");
+                MessageBox.Show(this, "먼저 기준 캡처를 하세요", "기준 이미지 없음");
+                return;
+            }
+            reference = new Bitmap(refImage);
+        }
         var token = (cts = new CancellationTokenSource()).Token;
         startBtn.Enabled = false;
         stopBtn.Enabled = true;
-        Task.Run(() => RunMacro(cfg, bounds, token)).ContinueWith(_ => BeginInvoke(() =>
+        Task.Run(() => RunMacro(cfg, bounds, reference, token)).ContinueWith(_ => BeginInvoke(() =>
         {
+            reference?.Dispose();
             cts?.Dispose();
             cts = null;
             startBtn.Enabled = true;
@@ -300,7 +388,7 @@ public class MainForm : Form
         Log("중지 요청");
     }
 
-    void RunMacro(MacroConfig cfg, Rectangle bounds, CancellationToken ct)
+    void RunMacro(MacroConfig cfg, Rectangle bounds, Bitmap? reference, CancellationToken ct)
     {
         try
         {
@@ -312,10 +400,16 @@ public class MainForm : Form
             Log("시작");
             for (int r = 1; cfg.Repeat == 0 || r <= cfg.Repeat; r++)
             {
+                if (cfg.MaxRepeats > 0 && r > cfg.MaxRepeats) { Log($"최대 반복 {cfg.MaxRepeats}회 도달"); break; }
                 for (int i = 0; i < cfg.Steps.Count; i++)
                 {
                     ct.ThrowIfCancellationRequested();
                     var s = cfg.Steps[i];
+                    if (s.Type == StepType.Check)
+                    {
+                        if (!RunCheck(cfg, bounds, reference!, s, r, i, ct)) return;
+                        continue;
+                    }
                     var abs = cfg.ToAbsolute(s.X, s.Y, bounds);
                     Native.Click(abs.X, abs.Y, s.Button);
                     Log($"[{r}회차] 단계 {i + 1}: {s.Button} 클릭 절대 ({abs.X}, {abs.Y}) {s.Note}");
@@ -328,6 +422,30 @@ public class MainForm : Form
         }
         catch (OperationCanceledException) { Log("중지됨"); }
         catch (Exception ex) { Log("오류: " + ex.Message); }
+    }
+
+    bool RunCheck(MacroConfig cfg, Rectangle bounds, Bitmap reference, Step s, int round, int idx, CancellationToken ct)
+    {
+        var region = AbsRegion(cfg, s, bounds);
+        var deadline = DateTime.UtcNow.AddMilliseconds(cfg.CheckTimeoutMs);
+        double score;
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            using var cap = ImageCheck.Capture(region);
+            score = ImageCheck.Similarity(cap, reference);
+            var preview = new Bitmap(cap);
+            BeginInvoke(() => SetPreview(lastPic, preview));
+            Log($"[{round}회차] 단계 {idx + 1}: 확인 유사도 {score:F3} (임계값 {cfg.Threshold:F2})");
+            if (score >= cfg.Threshold) return true;
+            if (DateTime.UtcNow >= deadline) break;
+            Wait(250, ct);
+        }
+        var msg = $"28일이 아님 → 중지 (유사도 {score:F3})";
+        Log(msg);
+        System.Media.SystemSounds.Exclamation.Play();
+        BeginInvoke(() => MessageBox.Show(this, msg, "매크로 중지", MessageBoxButtons.OK, MessageBoxIcon.Warning));
+        return false;
     }
 
     static void Wait(int ms, CancellationToken ct)
